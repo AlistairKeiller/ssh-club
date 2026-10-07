@@ -1,5 +1,5 @@
 //! Everything that touches the machine on behalf of a member.
-//! Each function does nothing when `cfg.dry_run` is set (tests).
+//! Under `cargo test` these do nothing, so tests never touch the real machine.
 
 use crate::config::*;
 use std::fs;
@@ -22,11 +22,11 @@ pub fn run(cmd: &str, args: &[&str]) -> bool {
 /// Create the member's home on first login. It is built under a temporary name
 /// and renamed into place, so nobody ever sees (or is stuck with) a half-made
 /// home. Safe to call on every login.
-pub fn provision(cfg: &Config, name: &str, uid: u32) -> io::Result<()> {
+pub fn provision(name: &str, uid: u32) -> io::Result<()> {
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
     let _guard = ONE_AT_A_TIME.lock().unwrap();
     let home = format!("{HOME_BASE}/{name}");
-    if cfg.dry_run || std::path::Path::new(&home).exists() {
+    if cfg!(test) || std::path::Path::new(&home).exists() {
         return Ok(());
     }
     let tmp = format!("{HOME_BASE}/.new-{name}"); // valid names never start with a dot
@@ -41,8 +41,8 @@ pub fn provision(cfg: &Config, name: &str, uid: u32) -> io::Result<()> {
 }
 
 /// Stop a member's processes and delete their files.
-pub fn remove(cfg: &Config, name: &str, uid: u32) {
-    if cfg.dry_run {
+pub fn remove(name: &str, uid: u32) {
+    if cfg!(test) {
         return;
     }
     let uid_s = uid.to_string();
@@ -58,16 +58,17 @@ pub fn remove(cfg: &Config, name: &str, uid: u32) {
 /// Does this uid have running processes? When in doubt, say yes: the answer
 /// only ever protects someone from being deleted.
 pub fn busy(uid: u32) -> bool {
-    Command::new("pgrep")
-        .args(["-u", &uid.to_string()])
-        .stdout(Stdio::null())
-        .status()
-        .map_or(true, |s| s.code() != Some(1))
+    !cfg!(test)
+        && Command::new("pgrep")
+            .args(["-u", &uid.to_string()])
+            .stdout(Stdio::null())
+            .status()
+            .map_or(true, |s| s.code() != Some(1))
 }
 
 /// Members must not reach the cloud metadata service (instance credentials).
-pub fn block_metadata(cfg: &Config) {
-    if cfg.dry_run {
+pub fn block_metadata() {
+    if cfg!(test) {
         return;
     }
     let owner = format!("{}-{}", UID_RANGE.0, UID_RANGE.1);

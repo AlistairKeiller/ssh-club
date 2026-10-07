@@ -43,7 +43,7 @@ fn main() {
 
 fn serve() -> Result<(), String> {
     let users = Arc::new(users::Users::new(Config::load())?);
-    host::block_metadata(&users.cfg);
+    host::block_metadata();
     if users.cfg.idle_delete_days > 0 {
         let users = Arc::clone(&users);
         std::thread::spawn(move || loop {

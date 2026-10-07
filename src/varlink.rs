@@ -151,6 +151,9 @@ pub fn serve(users: Arc<Users>) -> std::io::Result<()> {
 /// Call the running daemon (admin methods). Returns the reply's parameters.
 pub fn call(method: &str, params: Value) -> Result<Value, String> {
     let mut s = UnixStream::connect(SOCKET).map_err(|e| format!("cannot reach the club daemon ({e})"))?;
+    // sshd waits on this during logins; a stuck daemon must not stall it
+    let patience = Some(Duration::from_secs(10));
+    s.set_read_timeout(patience).and_then(|_| s.set_write_timeout(patience)).map_err(|e| e.to_string())?;
     let mut req = json!({"method": format!("io.systemd.Club.{method}"), "parameters": params}).to_string().into_bytes();
     req.push(0);
     s.write_all(&req).map_err(|e| e.to_string())?;

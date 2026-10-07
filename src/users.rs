@@ -4,7 +4,7 @@
 
 use crate::config::*;
 use crate::host;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::{fs, time::SystemTime};
 
@@ -71,13 +71,20 @@ impl Users {
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
         let mut db = Db::default();
+        let mut uids = HashSet::new();
         for line in text.lines().filter(|l| !l.is_empty()) {
             let mut f = line.split(' ');
-            let (Some(n), Some(Ok(uid)), Some(Ok(ts))) = (f.next(), f.next().map(str::parse), f.next().map(str::parse))
-            else {
+            let parsed = (f.next(), f.next().map(str::parse), f.next().map(str::parse));
+            let (Some(n), Some(Ok(uid)), Some(Ok(ts))) = parsed else {
                 return Err(format!("{}: cannot parse line '{line}'", path.display()));
             };
-            db.users.insert(n.into(), Entry { uid, authed: true, ts });
+            let ok = valid_name(n)
+                && (UID_RANGE.0..=UID_RANGE.1).contains(&uid)
+                && uids.insert(uid)
+                && db.users.insert(n.into(), Entry { uid, authed: true, ts }).is_none();
+            if !ok {
+                return Err(format!("{}: invalid or duplicate entry '{line}'", path.display()));
+            }
         }
         Ok(Users { cfg, db: Mutex::new(db) })
     }
@@ -109,10 +116,16 @@ impl Users {
         }
         db.users.retain(|_, e| e.authed || t.saturating_sub(e.ts) < PENDING_TTL);
         let authed = db.users.values().filter(|e| e.authed).count();
-        if db.users.len() - authed >= PENDING_MAX || authed >= self.cfg.max_users || taken_locally(name) {
+        if authed >= self.cfg.max_users || taken_locally(name) {
             return None;
         }
-        let uid = (UID_RANGE.0..=UID_RANGE.1).find(|u| db.users.values().all(|e| e.uid != *u))?;
+        if db.users.len() - authed >= PENDING_MAX {
+            // Never turn a new member away: drop the stalest placeholder instead.
+            let stalest = db.users.iter().filter(|(_, e)| !e.authed).min_by_key(|(_, e)| e.ts).map(|(n, _)| n.clone());
+            stalest.map(|n| db.users.remove(&n));
+        }
+        let used: HashSet<u32> = db.users.values().map(|e| e.uid).collect();
+        let uid = (UID_RANGE.0..=UID_RANGE.1).find(|u| !used.contains(u))?;
         db.users.insert(name.into(), Entry { uid, authed: false, ts: t });
         Some(uid)
     }
@@ -158,23 +171,24 @@ impl Users {
 
         let authed = db.users.values().filter(|e| e.authed).count();
         let e = db.users.get_mut(name).ok_or("unknown user")?;
-        if !e.authed {
-            if authed >= self.cfg.max_users {
-                return Err("full");
-            }
-            e.authed = true;
-            eprintln!("club: new workspace '{name}' (uid {}) from {rhost}", e.uid);
+        let (was_authed, was_ts, uid) = (e.authed, e.ts, e.uid);
+        if !was_authed && authed >= self.cfg.max_users {
+            return Err("full");
         }
-        e.ts = t;
-        let uid = e.uid;
-        // Refuse the login if we cannot remember the member: they would lose their uid.
-        self.save(&db).map_err(|e| {
-            eprintln!("club: cannot save members: {e}");
-            "setup failed"
-        })?;
+        (e.authed, e.ts) = (true, t);
+        // Refuse the login if we cannot remember the member (they would lose their uid),
+        // and leave no trace of the attempt.
+        if let Err(err) = self.save(&db) {
+            eprintln!("club: cannot save members: {err}");
+            (db.users.get_mut(name).unwrap().authed, db.users.get_mut(name).unwrap().ts) = (was_authed, was_ts);
+            return Err("setup failed");
+        }
+        if !was_authed {
+            eprintln!("club: new workspace '{name}' (uid {uid}) from {rhost}");
+        }
         drop(db);
 
-        host::provision(&self.cfg, name, uid).map_err(|e| {
+        host::provision(name, uid).map_err(|e| {
             eprintln!("club: setting up '{name}' failed: {e}");
             "setup failed"
         })
@@ -183,7 +197,7 @@ impl Users {
     pub fn delete(&self, name: &str) -> bool {
         let Some(uid) = self.uid_of(name) else { return false };
         // Files and processes first, so the uid is never reusable while they exist.
-        host::remove(&self.cfg, name, uid);
+        host::remove(name, uid);
         let mut db = self.db.lock().unwrap();
         db.users.remove(name);
         if let Err(e) = self.save(&db) {
@@ -211,7 +225,6 @@ pub fn test_users(tag: &str) -> Users {
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("password"), "pw\n").unwrap();
     Users::new(Config {
-        dry_run: true,
         password_file: dir.join("password"),
         state_dir: dir,
         ..Config::default()
@@ -262,6 +275,37 @@ mod tests {
         let u = test_users("corrupt");
         fs::write(u.cfg.state_dir.join("users"), "alice not-a-number 5\n").unwrap();
         assert!(Users::new(u.cfg.clone()).is_err());
+    }
+
+    #[test]
+    fn damaged_state_is_rejected() {
+        let u = test_users("damaged");
+        for bad in ["alice 0 5", "alice 5 5", "Bad_Name 20001 5", "a 20001 5\nb 20001 5", "a 20001 5\na 20002 5"] {
+            fs::write(u.cfg.state_dir.join("users"), format!("{bad}\n")).unwrap();
+            assert!(Users::new(u.cfg.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn failed_registration_leaves_no_trace() {
+        let mut u = test_users("savefail");
+        u.cfg.max_users = 1;
+        u.lookup("first").unwrap();
+        u.lookup("second").unwrap();
+        let good = u.cfg.state_dir.clone();
+        u.cfg.state_dir = "/nonexistent".into();
+        assert_eq!(u.auth("first", "pw", "h"), Err("setup failed"));
+        u.cfg.state_dir = good;
+        assert_eq!(u.auth("second", "pw", "h"), Ok(()), "the failed attempt must not use up the slot");
+    }
+
+    #[test]
+    fn full_placeholder_table_evicts_instead_of_refusing() {
+        let u = test_users("evict");
+        for i in 0..=PENDING_MAX {
+            assert!(u.lookup(&format!("scan{i}")).is_some());
+        }
+        assert!(u.lookup("realmember").is_some());
     }
 
     #[test]

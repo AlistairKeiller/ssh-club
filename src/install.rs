@@ -60,6 +60,23 @@ fn strip_block(text: &str) -> String {
     out
 }
 
+/// Replace a file in one step so sshd never reads a half-written PAM config.
+fn write_atomic(path: &str, content: &str) -> std::io::Result<()> {
+    let tmp = format!("{path}.club-tmp");
+    fs::write(&tmp, content)?;
+    fs::rename(&tmp, path)
+}
+
+/// Does the host already use any uid or gid in the range club hands out?
+fn range_in_use() -> bool {
+    ["/etc/passwd", "/etc/group"].iter().any(|f| {
+        let text = fs::read_to_string(f).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| l.split(':').nth(2)?.parse::<u32>().ok())
+            .any(|id| (UID_RANGE.0..=UID_RANGE.1).contains(&id))
+    })
+}
+
 fn reload_sshd() {
     let _ = run("systemctl", &["reload", "ssh"]) || run("systemctl", &["reload", "sshd"]);
 }
@@ -68,6 +85,10 @@ pub fn install() -> Result<(), String> {
     crate::need_root()?;
     if !Path::new("/run/systemd/system").exists() {
         return Err("needs a Linux host running systemd".into());
+    }
+
+    if range_in_use() {
+        return Err(format!("this host already has users or groups with ids in {}-{}; club needs that range", UID_RANGE.0, UID_RANGE.1));
     }
 
     step("installing packages");
@@ -102,7 +123,7 @@ pub fn install() -> Result<(), String> {
     step("configuring sshd and PAM");
     io(fs::write(SSHD_DROPIN, SSHD_SETTINGS), SSHD_DROPIN)?;
     let pam = io(fs::read_to_string(PAM_FILE), PAM_FILE)?;
-    io(fs::write(PAM_FILE, format!("{PAM_BLOCK}{}", strip_block(&pam))), PAM_FILE)?;
+    io(write_atomic(PAM_FILE, &format!("{PAM_BLOCK}{}", strip_block(&pam))), PAM_FILE)?;
     let _ = fs::create_dir_all("/run/sshd"); // `sshd -T` needs it before sshd has ever started
     let sshd = Command::new("sshd").arg("-T").output();
     let effective = sshd.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
@@ -144,7 +165,7 @@ pub fn uninstall() -> Result<(), String> {
         let _ = fs::remove_file(f);
     }
     if let Ok(pam) = fs::read_to_string(PAM_FILE) {
-        io(fs::write(PAM_FILE, strip_block(&pam)), PAM_FILE)?;
+        io(write_atomic(PAM_FILE, &strip_block(&pam)), PAM_FILE)?;
     }
     reload_sshd();
     println!("Removed the service and the sshd/PAM hooks. Members' files are untouched (see the README to erase them).");

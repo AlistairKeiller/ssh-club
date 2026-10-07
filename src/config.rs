@@ -21,7 +21,6 @@ pub struct Config {
     // overridable so tests never touch the host
     pub state_dir: PathBuf,
     pub password_file: PathBuf,
-    pub dry_run: bool,
 }
 
 impl Default for Config {
@@ -32,7 +31,6 @@ impl Default for Config {
             idle_delete_days: 0,
             state_dir: STATE_DIR.into(),
             password_file: PASSWORD_FILE.into(),
-            dry_run: false,
         }
     }
 }

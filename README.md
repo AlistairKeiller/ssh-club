@@ -124,6 +124,7 @@ There is no measured user count; watch real use and adjust `memory_gb`.
 | install says the self-test failed | `getent passwd club-selftest` must print a line; `passwd:` in `/etc/nsswitch.conf` needs `systemd`; see `journalctl -u club` |
 | the daemon will not start | `journalctl -u club`. If it reports an unreadable `/var/lib/club/users`, restore that file: starting without it would reissue members' uids |
 | every login is "Permission denied" | `journalctl -u club -f` shows each attempt and why (`wrong password`, `throttled`, `full`); `sudo sshd -T \| grep passwordauth` must say yes |
+| `useradd`/`adduser` says the user "already exists" | club answers for every valid name while it runs. Stop it first: `sudo systemctl stop club; sudo adduser ...; sudo systemctl start club` |
 | one person is locked out | 10 wrong passwords block that client address for a minute; members behind one NAT share it |
 
 **Erase everything:** `sudo club uninstall; sudo rm -rf /etc/club /var/lib/club /home/club /usr/local/bin/club`
