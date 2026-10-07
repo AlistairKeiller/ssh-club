@@ -1,0 +1,7 @@
+#cloud-config
+# Paste into "Show advanced options -> Cloud-init script" when creating an Oracle
+# (or any) VM, and the workspace server sets itself up on first boot.
+# Get the generated password afterwards with:  sudo club password
+# Replace OWNER with the GitHub account that hosts this repo.
+runcmd:
+  - curl -fsSL https://raw.githubusercontent.com/OWNER/ssh-club/main/install.sh | sh
