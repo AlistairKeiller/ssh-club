@@ -42,7 +42,7 @@ fn main() {
 }
 
 fn serve() -> Result<(), String> {
-    let users = Arc::new(users::Users::new(Config::load()));
+    let users = Arc::new(users::Users::new(Config::load())?);
     host::block_metadata(&users.cfg);
     if users.cfg.idle_delete_days > 0 {
         let users = Arc::clone(&users);
@@ -82,9 +82,9 @@ fn list() -> Result<(), String> {
     let reply = varlink::call("List", json!({}))?;
     let mut members: Vec<(String, u32, u64)> = serde_json::from_value(reply["members"].clone()).unwrap_or_default();
     members.sort_by_key(|m| std::cmp::Reverse(m.2));
-    println!("{:<22} {:>6}  {:<7} LAST LOGIN", "NAME", "UID", "STATE");
+    println!("{:<22} {:>6}  {:<8} LAST LOGIN", "NAME", "UID", "RUNNING");
     for (name, uid, last) in &members {
-        let state = if host::online(*uid) { "online" } else { "-" };
+        let state = if host::busy(*uid) { "yes" } else { "-" };
         let age = users::now().saturating_sub(*last);
         let when = match age {
             0..=119 => "just now".into(),
@@ -92,7 +92,7 @@ fn list() -> Result<(), String> {
             7200..=172_799 => format!("{}h ago", age / 3600),
             _ => format!("{}d ago", age / 86_400),
         };
-        println!("{name:<22} {uid:>6}  {state:<7} {when}");
+        println!("{name:<22} {uid:>6}  {state:<8} {when}");
     }
     println!("\n{} of {} members", members.len(), reply["max_users"]);
     Ok(())

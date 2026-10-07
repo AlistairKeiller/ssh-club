@@ -6,11 +6,17 @@
 use crate::config::*;
 use crate::users::Users;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+// Any local user can reach this socket, so keep a bad client from costing us much.
+const MAX_CONNECTIONS: usize = 256;
+const MAX_MESSAGE: u64 = 64 * 1024;
+static CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 fn error(name: &str) -> Value {
     json!({"error": name, "parameters": {}})
@@ -74,6 +80,10 @@ fn lookup(users: &Users, p: &Value, group: bool) -> Value {
             "userName": name, "uid": uid, "gid": uid, "realName": name,
             "homeDirectory": format!("{HOME_BASE}/{name}"), "shell": "/bin/bash",
             "disposition": "regular", "service": SERVICE,
+            // logind applies these to the member's systemd slice at login
+            "memoryMax": users.cfg.memory_gb << 30,
+            "memoryHigh": (users.cfg.memory_gb << 30) / 4 * 3,
+            "tasksMax": 1500,
         })
     };
     json!({"parameters": {"record": record, "incomplete": false}})
@@ -105,10 +115,10 @@ fn serve_connection(users: Arc<Users>, stream: UnixStream) {
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        if !matches!(input.read_until(0, &mut buf), Ok(n) if n > 0) {
-            return;
+        let read = (&mut input).take(MAX_MESSAGE).read_until(0, &mut buf);
+        if read.is_err() || buf.pop() != Some(0) {
+            return; // closed, timed out, or longer than a message can be
         }
-        buf.pop(); // the NUL
         let Ok(req) = serde_json::from_slice::<Value>(&buf) else { return };
         let mut reply = serde_json::to_vec(&handle(&users, peer, &req)).unwrap_or_default();
         reply.push(0);
@@ -125,8 +135,15 @@ pub fn serve(users: Arc<Users>) -> std::io::Result<()> {
     std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o666))?;
     eprintln!("club: listening on {SOCKET}");
     for conn in listener.incoming().flatten() {
+        if CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+            continue; // drop it
+        }
         let users = Arc::clone(&users);
-        std::thread::spawn(move || serve_connection(users, conn));
+        std::thread::spawn(move || {
+            serve_connection(users, conn);
+            CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+        });
     }
     Ok(())
 }
@@ -164,6 +181,7 @@ mod tests {
         let r = ask(&u, Some(1000), GET_USER, json!({"userName": "alice", "service": SERVICE}));
         let rec = &r["parameters"]["record"];
         assert_eq!((rec["userName"].as_str(), rec["homeDirectory"].as_str()), (Some("alice"), Some("/home/club/alice")));
+        assert_eq!(rec["memoryMax"], 3u64 << 30);
         let uid = rec["uid"].as_u64().unwrap();
 
         let r = ask(&u, None, GET_USER, json!({"uid": uid, "service": SERVICE}));

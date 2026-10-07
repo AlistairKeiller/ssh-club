@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::{fs, time::SystemTime};
 
-const PENDING_TTL: u64 = 600;
-const PENDING_MAX: usize = 200;
+const PENDING_TTL: u64 = 180; // longer than sshd's 120 s login grace time
+const PENDING_MAX: usize = 2000; // scanners guess many usernames; this must not fill up
 const FAIL_LIMIT: u32 = 10; // wrong passwords allowed per client address...
 const FAIL_WINDOW: u64 = 60; // ...per this many seconds
 
@@ -61,20 +61,28 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 impl Users {
     /// The saved file has one line per member: `name uid last_login`.
-    pub fn new(cfg: Config) -> Users {
+    /// A missing file means a fresh install; an unreadable one must stop us,
+    /// or forgotten members would be given each other's uids (and files).
+    pub fn new(cfg: Config) -> Result<Users, String> {
+        let path = cfg.state_dir.join("users");
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
         let mut db = Db::default();
-        for line in fs::read_to_string(cfg.state_dir.join("users")).unwrap_or_default().lines() {
+        for line in text.lines().filter(|l| !l.is_empty()) {
             let mut f = line.split(' ');
-            if let (Some(n), Some(Ok(uid)), Some(Ok(ts))) =
-                (f.next(), f.next().map(str::parse), f.next().map(str::parse))
-            {
-                db.users.insert(n.into(), Entry { uid, authed: true, ts });
-            }
+            let (Some(n), Some(Ok(uid)), Some(Ok(ts))) = (f.next(), f.next().map(str::parse), f.next().map(str::parse))
+            else {
+                return Err(format!("{}: cannot parse line '{line}'", path.display()));
+            };
+            db.users.insert(n.into(), Entry { uid, authed: true, ts });
         }
-        Users { cfg, db: Mutex::new(db) }
+        Ok(Users { cfg, db: Mutex::new(db) })
     }
 
-    fn save(&self, db: &Db) {
+    fn save(&self, db: &Db) -> std::io::Result<()> {
         let text: String = db
             .users
             .iter()
@@ -83,9 +91,7 @@ impl Users {
             .collect();
         let path = self.cfg.state_dir.join("users");
         let tmp = path.with_extension("tmp");
-        if let Err(e) = fs::write(&tmp, text).and_then(|_| fs::rename(&tmp, &path)) {
-            eprintln!("club: cannot save {}: {e}", path.display());
-        }
+        fs::write(&tmp, text).and_then(|_| fs::rename(&tmp, &path))
     }
 
     /// The uid for `name`, handing out a placeholder to a new valid name.
@@ -94,10 +100,13 @@ impl Users {
             return None;
         }
         let mut db = self.db.lock().unwrap();
-        if let Some(e) = db.users.get(name) {
+        let t = now();
+        if let Some(e) = db.users.get_mut(name) {
+            if !e.authed {
+                e.ts = t; // still being used to log in: keep the placeholder alive
+            }
             return Some(e.uid);
         }
-        let t = now();
         db.users.retain(|_, e| e.authed || t.saturating_sub(e.ts) < PENDING_TTL);
         let authed = db.users.values().filter(|e| e.authed).count();
         if db.users.len() - authed >= PENDING_MAX || authed >= self.cfg.max_users || taken_locally(name) {
@@ -158,7 +167,11 @@ impl Users {
         }
         e.ts = t;
         let uid = e.uid;
-        self.save(&db);
+        // Refuse the login if we cannot remember the member: they would lose their uid.
+        self.save(&db).map_err(|e| {
+            eprintln!("club: cannot save members: {e}");
+            "setup failed"
+        })?;
         drop(db);
 
         host::provision(&self.cfg, name, uid).map_err(|e| {
@@ -168,20 +181,23 @@ impl Users {
     }
 
     pub fn delete(&self, name: &str) -> bool {
+        let Some(uid) = self.uid_of(name) else { return false };
+        // Files and processes first, so the uid is never reusable while they exist.
+        host::remove(&self.cfg, name, uid);
         let mut db = self.db.lock().unwrap();
-        let Some(e) = db.users.remove(name) else { return false };
-        self.save(&db);
-        drop(db);
-        host::remove(&self.cfg, name, e.uid);
+        db.users.remove(name);
+        if let Err(e) = self.save(&db) {
+            eprintln!("club: cannot save members: {e}");
+        }
         eprintln!("club: deleted '{name}'");
         true
     }
 
-    /// Delete workspaces idle past `idle_delete_days`, unless logged in.
+    /// Delete members idle past `idle_delete_days` who have no running processes.
     pub fn reap(&self) {
         let days = self.cfg.idle_delete_days;
         for (name, uid, last) in self.members() {
-            if days > 0 && last < now().saturating_sub(days * 86_400) && !host::online(uid) {
+            if days > 0 && last < now().saturating_sub(days * 86_400) && !host::busy(uid) {
                 self.delete(&name);
             }
         }
@@ -200,6 +216,7 @@ pub fn test_users(tag: &str) -> Users {
         state_dir: dir,
         ..Config::default()
     })
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -235,9 +252,16 @@ mod tests {
         assert_eq!(u.auth("alice", "bad", "h"), Err("wrong password"));
         assert_eq!(u.auth("alice", "pw", "h"), Ok(()));
 
-        let again = Users::new(u.cfg.clone());
+        let again = Users::new(u.cfg.clone()).unwrap();
         assert_eq!(again.uid_of("alice"), Some(uid));
         assert_eq!(again.uid_of("ghost"), None, "placeholders are not saved");
+    }
+
+    #[test]
+    fn unreadable_state_stops_startup() {
+        let u = test_users("corrupt");
+        fs::write(u.cfg.state_dir.join("users"), "alice not-a-number 5\n").unwrap();
+        assert!(Users::new(u.cfg.clone()).is_err());
     }
 
     #[test]

@@ -28,7 +28,6 @@ const UNIT: &str = "\
 [Unit]
 Description=club: on-demand SSH workspaces
 After=local-fs.target network.target netfilter-persistent.service
-RequiresMountsFor=/home/club /var/lib/club
 
 [Service]
 ExecStart=/usr/local/bin/club serve
@@ -73,7 +72,7 @@ pub fn install() -> Result<(), String> {
 
     step("installing packages");
     let apt = Command::new("apt-get")
-        .args(["install", "-y", "-qq", "quota", "iptables", "libnss-systemd", "openssh-server"])
+        .args(["install", "-y", "-qq", "iptables", "libnss-systemd", "openssh-server"])
         .env("DEBIAN_FRONTEND", "noninteractive")
         .stdout(Stdio::null())
         .status();
@@ -96,7 +95,9 @@ pub fn install() -> Result<(), String> {
     }
 
     step("preparing /home/club");
-    mount_homes(&Config::load())?;
+    io(fs::create_dir_all(HOME_BASE), HOME_BASE)?;
+    // traverse-only: members reach their own home but cannot list each other's names
+    io(fs::set_permissions(HOME_BASE, std::os::unix::fs::PermissionsExt::from_mode(0o711)), HOME_BASE)?;
 
     step("configuring sshd and PAM");
     io(fs::write(SSHD_DROPIN, SSHD_SETTINGS), SSHD_DROPIN)?;
@@ -134,43 +135,6 @@ pub fn install() -> Result<(), String> {
     }
     println!("Test a login from a second terminal before closing this one.");
     Ok(())
-}
-
-/// Mount the sparse ext4 image that holds every home (or just use a directory).
-fn mount_homes(cfg: &Config) -> Result<(), String> {
-    io(fs::create_dir_all(HOME_BASE), HOME_BASE)?;
-    let mounted = fs::read_to_string("/proc/mounts").is_ok_and(|m| m.lines().any(|l| l.contains(" /home/club ")));
-    if cfg.home_pool_gb > 0 && !mounted {
-        let img = format!("{STATE_DIR}/home.img");
-        let quota = cfg.disk_quota_gb > 0;
-        if !Path::new(&img).exists() {
-            let file = io(fs::File::create(&img), &img)?;
-            io(file.set_len(cfg.home_pool_gb << 30), &img)?;
-            let mut mkfs = vec!["-q", "-F"];
-            if quota {
-                mkfs.extend(["-O", "quota", "-E", "quotatype=usrquota"]);
-            }
-            mkfs.push(&img);
-            if !run("mkfs.ext4", &mkfs) {
-                return Err("mkfs.ext4 failed".into());
-            }
-        }
-        let opts = if quota { "loop,nosuid,nodev,noatime,usrquota" } else { "loop,nosuid,nodev,noatime" };
-        let old = fs::read_to_string("/etc/fstab").unwrap_or_default();
-        let mut fstab: Vec<&str> = old.lines().filter(|l| !l.ends_with("# club")).collect();
-        let line = format!("{img} {HOME_BASE} ext4 {opts} 0 0 # club");
-        fstab.push(&line);
-        io(fs::write("/etc/fstab", fstab.join("\n") + "\n"), "/etc/fstab")?;
-        run("systemctl", &["daemon-reload"]);
-        if !run("mount", &[HOME_BASE]) {
-            return Err(format!(
-                "could not mount {img}. If this kernel lacks ext4 quota support, set \
-                 disk_quota_gb = 0 in {CONF_FILE}, delete {img}, and run install again."
-            ));
-        }
-    }
-    // traverse-only: members reach their own home but cannot list each other's names
-    io(fs::set_permissions(HOME_BASE, std::os::unix::fs::PermissionsExt::from_mode(0o711)), HOME_BASE)
 }
 
 pub fn uninstall() -> Result<(), String> {

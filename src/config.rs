@@ -16,10 +16,7 @@ pub const UID_RANGE: (u32, u32) = (20_000, 29_999);
 #[derive(Clone)]
 pub struct Config {
     pub max_users: usize,
-    pub mem_high: String,
-    pub mem_max: String,
-    pub disk_quota_gb: u64,
-    pub home_pool_gb: u64,
+    pub memory_gb: u64,
     pub idle_delete_days: u64,
     // overridable so tests never touch the host
     pub state_dir: PathBuf,
@@ -31,10 +28,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             max_users: 500,
-            mem_high: "2G".into(),
-            mem_max: "3G".into(),
-            disk_quota_gb: 5,
-            home_pool_gb: 100,
+            memory_gb: 3,
             idle_delete_days: 0,
             state_dir: STATE_DIR.into(),
             password_file: PASSWORD_FILE.into(),
@@ -52,10 +46,7 @@ impl Config {
             let v = v.trim();
             match k.trim() {
                 "max_users" => c.max_users = v.parse().unwrap_or(c.max_users),
-                "mem_high" => c.mem_high = v.into(),
-                "mem_max" => c.mem_max = v.into(),
-                "disk_quota_gb" => c.disk_quota_gb = v.parse().unwrap_or(c.disk_quota_gb),
-                "home_pool_gb" => c.home_pool_gb = v.parse().unwrap_or(c.home_pool_gb),
+                "memory_gb" => c.memory_gb = v.parse().unwrap_or(c.memory_gb),
                 "idle_delete_days" => c.idle_delete_days = v.parse().unwrap_or(0),
                 other => eprintln!("club: ignoring unknown setting '{other}'"),
             }
@@ -67,21 +58,12 @@ impl Config {
 pub const CONF_TEMPLATE: &str = "\
 # Restart after editing:  sudo systemctl restart club
 
-# Most workspaces that may exist.
+# Most members that may exist.
 max_users = 500
 
-# Per-user memory: throttled above mem_high, killed above mem_max.
-mem_high = 2G
-mem_max = 3G
+# Hard memory limit per member, in GB (they are slowed down at 3/4 of it).
+memory_gb = 3
 
-# Per-user disk quota in GB (0 = none; also skips ext4 quota setup).
-disk_quota_gb = 5
-
-# Size of the sparse image holding every home, in GB. Members can fill this
-# but never the host disk. 0 = plain directory on the host disk.
-# Changing it needs a manual reformat; see the README.
-home_pool_gb = 100
-
-# Delete workspaces unused for this many days (0 = never).
+# Delete members unused for this many days (0 = never).
 idle_delete_days = 0
 ";

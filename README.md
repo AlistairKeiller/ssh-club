@@ -50,7 +50,7 @@ username and keep it; the name is the workspace. Names are 1-20 characters of
 ## Running it
 
 ```sh
-sudo club list                  # members, who is online, last login
+sudo club list                  # members, whether they have processes running, last login
 sudo club delete alice          # remove a member and their files
 sudo club password --rotate     # new shared password; existing members unaffected
 sudo club uninstall             # remove the hooks (files stay)
@@ -61,12 +61,10 @@ Settings are in `/etc/club/club.conf`; restart with `sudo systemctl restart club
 | key | default | meaning |
 |---|---|---|
 | `max_users` | 500 | most members that can exist |
-| `mem_high` / `mem_max` | 2G / 3G | per-member memory: throttled above the first, killed above the second |
-| `disk_quota_gb` | 5 | per-member disk quota (0 = none) |
-| `home_pool_gb` | 100 | size of the sparse image holding all homes (0 = plain directory) |
-| `idle_delete_days` | 0 | delete members unused this long (0 = never); anyone logged in is kept |
+| `memory_gb` | 3 | hard memory limit per member (they are slowed down at 3/4 of it) |
+| `idle_delete_days` | 0 | delete members unused this long (0 = never); anyone with running processes is kept |
 
-New limits apply to a member at their next login.
+Limits are enforced by systemd-logind from each member's user record, so a changed setting applies at their next login.
 
 ## How it works
 
@@ -80,17 +78,19 @@ the system believe in users that do not exist yet.
 2. **One PAM line** in `/etc/pam.d/sshd` runs `club pam-auth`, which asks the
    daemon to check the shared password (constant-time compare; after 10 wrong
    guesses a client address is refused for a minute).
-3. **First good login** creates `/home/club/<name>` (mode 0700, from `/etc/skel`),
-   a disk quota, and memory/process limits on the member's systemd slice
-   (`systemctl set-property`). A name that never logs in leaves nothing behind.
-4. **Homes** live on a sparse ext4 image mounted `nosuid,nodev` at `/home/club`,
-   so a runaway member can fill the club's pool but not the host's disk.
+3. **First good login** creates `/home/club/<name>` (mode 0700, copied from
+   `/etc/skel`; built under a temporary name and renamed into place, so it is
+   never half-made). The member's record also carries memory and process limits,
+   which systemd-logind applies to their slice. A name that never logs in leaves
+   nothing behind.
+4. **Plain directories** on the host's disk. There is no per-member disk quota.
 5. **One firewall rule** stops members reaching the cloud metadata service
    (`169.254.169.254`), where instance credentials live.
 
-Files: `/etc/club/{club.conf,password}`, `/var/lib/club/{users,home.img}`,
-`/usr/local/bin/club`, `club.service`, `/etc/ssh/sshd_config.d/10-club.conf`,
-one block in `/etc/pam.d/sshd`, one line in `/etc/fstab`.
+Files: `/etc/club/{club.conf,password}`, `/var/lib/club/users`, `/home/club/`,
+`/usr/local/bin/club`, `club.service`, `/etc/ssh/sshd_config.d/10-club.conf`, and
+one block in `/etc/pam.d/sshd`. If club ever stops running, that PAM block simply
+falls through to normal logins; it cannot lock you out.
 
 ## What members get, and what they do not
 
@@ -102,6 +102,9 @@ is not a container sandbox:
   tools (`uv`, `nvm`, `rustup`) work in a home directory.
 - Homes are private (0700) and `/home/club` is not listable, but members can see
   each other's processes (`ps`) and share `/tmp`, `localhost` and the network.
+- **Disk is shared.** Nothing stops a member filling the host disk (their home,
+  or `/tmp`). If that matters, mount a separate volume at `/home/club` before
+  installing and give `/tmp` its own size-limited tmpfs.
 - A kernel bug affects everyone. Keep the host patched.
 - Anyone with the club password can log in as any username. Rotate it when a
   member leaves.
@@ -109,24 +112,21 @@ is not a container sandbox:
   images ship with locked passwords). Other users' home directories under `/home`
   that are world-readable are readable by members; tighten them with `chmod o-rwx`.
 
-Capacity: an idle member costs no RAM. A VS Code server is typically 400-600 MB
-while in use, so on 4 cores and 24 GB expect roughly 30-40 people active in VS
-Code at once, many more on plain SSH. `systemd-zram-generator` helps absorb bursts.
+Capacity: an idle member costs no RAM; active members cost whatever they run (a
+VS Code server alone is several hundred MB, and compilers can use much more).
+There is no measured user count; watch real use and adjust `memory_gb`.
+`systemd-zram-generator` helps absorb bursts.
 
 ## Troubleshooting
 
 | symptom | check |
 |---|---|
 | install says the self-test failed | `getent passwd club-selftest` must print a line; `passwd:` in `/etc/nsswitch.conf` needs `systemd`; see `journalctl -u club` |
-| install says it cannot mount the image | the kernel lacks ext4 quota support: set `disk_quota_gb = 0`, delete `/var/lib/club/home.img`, run install again |
+| the daemon will not start | `journalctl -u club`. If it reports an unreadable `/var/lib/club/users`, restore that file: starting without it would reissue members' uids |
 | every login is "Permission denied" | `journalctl -u club -f` shows each attempt and why (`wrong password`, `throttled`, `full`); `sudo sshd -T \| grep passwordauth` must say yes |
 | one person is locked out | 10 wrong passwords block that client address for a minute; members behind one NAT share it |
 
-**Resize the pool:** `sudo systemctl stop club && sudo umount /home/club`, then
-`truncate -s 200G /var/lib/club/home.img && e2fsck -f /var/lib/club/home.img && resize2fs /var/lib/club/home.img`,
-update `home_pool_gb`, and run `sudo club install`.
-
-**Erase everything:** `sudo club uninstall; sudo umount /home/club; sudo sed -i '/# club$/d' /etc/fstab; sudo rm -rf /etc/club /var/lib/club /home/club; sudo rm /usr/local/bin/club`
+**Erase everything:** `sudo club uninstall; sudo rm -rf /etc/club /var/lib/club /home/club /usr/local/bin/club`
 
 ## Development
 
@@ -135,5 +135,5 @@ needed). The real chain (sshd, PAM, nss-systemd) needs a systemd Linux machine;
 an OrbStack VM (`orb create ubuntu:24.04 t`) works well.
 
 Code map: `users.rs` who exists and who may log in, `varlink.rs` the protocol,
-`host.rs` homes/limits/quota/firewall, `install.rs` the installer (all config
+`host.rs` homes, cleanup, firewall, `install.rs` the installer (all config
 embedded), `main.rs` the commands.
