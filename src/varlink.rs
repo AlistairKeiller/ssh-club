@@ -1,66 +1,48 @@
 //! Varlink over a Unix socket: JSON messages, each ended by a NUL byte.
-//! One socket, two audiences:
-//!   io.systemd.UserDatabase.*  what nss-systemd/sshd ask (anyone may call)
-//!   io.systemd.Club.*          what PAM and the admin commands ask (root only)
+//! sshd (through nss-systemd) asks io.systemd.UserDatabase.* "does this user
+//! exist?"; the PAM hook asks io.systemd.Club.Auth "is this password right?".
 
-use crate::config::*;
+use crate::paths::*;
 use crate::users::Users;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-// Any local user can reach this socket, so keep a bad client from costing us much.
-const MAX_CONNECTIONS: usize = 256;
-const MAX_MESSAGE: u64 = 64 * 1024;
-static CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+const MAX_MESSAGE: u64 = 64 * 1024; // any local user can reach this socket
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn error(name: &str) -> Value {
     json!({"error": name, "parameters": {}})
 }
 
-fn udb_error(name: &str) -> Value {
-    error(&format!("io.systemd.UserDatabase.{name}"))
+fn not_found() -> Value {
+    error("io.systemd.UserDatabase.NoRecordFound")
 }
 
-/// Answer one request. Pure apart from the Users it is given, so it is testable.
-pub fn handle(users: &Users, peer_uid: Option<u32>, req: &Value) -> Value {
-    let method = req["method"].as_str().unwrap_or("");
+/// Answer one request.
+pub fn handle(users: &Users, req: &Value) -> Value {
     let p = &req["parameters"];
-
-    if let Some(kind) = method.strip_prefix("io.systemd.UserDatabase.") {
-        // nss-systemd names the service after the socket.
-        if !matches!(p["service"].as_str(), Some(SERVICE | "io.systemd.Multiplexer")) {
-            return udb_error("BadService");
+    match req["method"].as_str().unwrap_or("") {
+        "io.systemd.Club.Auth" => {
+            let ok = users.auth(p["name"].as_str().unwrap_or(""), p["password"].as_str().unwrap_or(""));
+            json!({"parameters": {"ok": ok}})
         }
-        return match kind {
-            "GetUserRecord" => lookup(users, p, false),
-            "GetGroupRecord" => lookup(users, p, true),
-            _ => udb_error("NoRecordFound"), // memberships: a user is only in their own group
-        };
+        "io.systemd.UserDatabase.GetUserRecord" => lookup(users, p, false),
+        "io.systemd.UserDatabase.GetGroupRecord" => lookup(users, p, true),
+        m if m.starts_with("io.systemd.UserDatabase.") => not_found(), // a user is only in their own group
+        _ => error("org.varlink.service.MethodNotFound"),
     }
-
-    if peer_uid != Some(0) || !method.starts_with("io.systemd.Club.") {
-        return error("org.varlink.service.PermissionDenied");
-    }
-    let name = p["name"].as_str().unwrap_or("");
-    let reply = match &method["io.systemd.Club.".len()..] {
-        "Auth" => {
-            let r = users.auth(name, p["password"].as_str().unwrap_or(""), p["rhost"].as_str().unwrap_or("-"));
-            json!({"ok": r.is_ok(), "reason": r.err()})
-        }
-        "Delete" => json!({"ok": users.delete(name)}),
-        "List" => json!({"members": users.members(), "max_users": users.cfg.max_users}),
-        _ => return error("org.varlink.service.MethodNotFound"),
-    };
-    json!({"parameters": reply})
 }
 
 /// GetUserRecord / GetGroupRecord. Enumeration (no name, no id) is not supported.
 fn lookup(users: &Users, p: &Value, group: bool) -> Value {
+    // nss-systemd names the service after the socket.
+    if !matches!(p["service"].as_str(), Some(SERVICE | "io.systemd.Multiplexer")) {
+        return error("io.systemd.UserDatabase.BadService");
+    }
     let name = p[if group { "groupName" } else { "userName" }].as_str();
     let id = p[if group { "gid" } else { "uid" }].as_u64();
     let found = match (name, id) {
@@ -69,9 +51,9 @@ fn lookup(users: &Users, p: &Value, group: bool) -> Value {
         (None, Some(i)) => users.name_of(i as u32).map(|n| (n, i as u32)),
         _ => None,
     };
-    let Some((name, uid)) = found else { return udb_error("NoRecordFound") };
+    let Some((name, uid)) = found else { return not_found() };
     if id.is_some_and(|i| i != uid as u64) {
-        return udb_error("ConflictingRecordFound");
+        return error("io.systemd.UserDatabase.ConflictingRecordFound");
     }
     let record = if group {
         json!({"groupName": name, "gid": uid, "disposition": "regular", "service": SERVICE})
@@ -80,36 +62,14 @@ fn lookup(users: &Users, p: &Value, group: bool) -> Value {
             "userName": name, "uid": uid, "gid": uid, "realName": name,
             "homeDirectory": format!("{HOME_BASE}/{name}"), "shell": "/bin/bash",
             "disposition": "regular", "service": SERVICE,
-            // logind applies these to the member's systemd slice at login
-            "memoryMax": users.cfg.memory_gb << 30,
-            "memoryHigh": (users.cfg.memory_gb << 30) / 4 * 3,
-            "tasksMax": 1500,
         })
     };
     json!({"parameters": {"record": record, "incomplete": false}})
 }
 
-#[cfg(target_os = "linux")]
-fn peer_uid(s: &UnixStream) -> Option<u32> {
-    use std::os::fd::AsRawFd;
-    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: cred and len outlive the call and have the sizes getsockopt expects.
-    let rc = unsafe {
-        libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred as *mut _ as *mut _, &mut len)
-    };
-    (rc == 0).then_some(cred.uid)
-}
-
-/// No SO_PEERCRED off Linux; lets the tests run on a Mac. Club only ships for Linux.
-#[cfg(not(target_os = "linux"))]
-fn peer_uid(_: &UnixStream) -> Option<u32> {
-    Some(0)
-}
-
 fn serve_connection(users: Arc<Users>, stream: UnixStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let peer = peer_uid(&stream);
+    let _ = stream.set_read_timeout(Some(TIMEOUT));
+    let _ = stream.set_write_timeout(Some(TIMEOUT));
     let Ok(mut out) = stream.try_clone() else { return };
     let mut input = BufReader::new(stream);
     let mut buf = Vec::new();
@@ -120,7 +80,7 @@ fn serve_connection(users: Arc<Users>, stream: UnixStream) {
             return; // closed, timed out, or longer than a message can be
         }
         let Ok(req) = serde_json::from_slice::<Value>(&buf) else { return };
-        let mut reply = serde_json::to_vec(&handle(&users, peer, &req)).unwrap_or_default();
+        let mut reply = handle(&users, &req).to_string().into_bytes();
         reply.push(0);
         if out.write_all(&reply).is_err() {
             return;
@@ -135,36 +95,27 @@ pub fn serve(users: Arc<Users>) -> std::io::Result<()> {
     std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o666))?;
     eprintln!("club: listening on {SOCKET}");
     for conn in listener.incoming().flatten() {
-        if CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-            CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
-            continue; // drop it
-        }
         let users = Arc::clone(&users);
-        std::thread::spawn(move || {
-            serve_connection(users, conn);
-            CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
-        });
+        std::thread::spawn(move || serve_connection(users, conn));
     }
     Ok(())
 }
 
-/// Call the running daemon (admin methods). Returns the reply's parameters.
-pub fn call(method: &str, params: Value) -> Result<Value, String> {
-    let mut s = UnixStream::connect(SOCKET).map_err(|e| format!("cannot reach the club daemon ({e})"))?;
-    // sshd waits on this during logins; a stuck daemon must not stall it
-    let patience = Some(Duration::from_secs(10));
-    s.set_read_timeout(patience).and_then(|_| s.set_write_timeout(patience)).map_err(|e| e.to_string())?;
-    let mut req = json!({"method": format!("io.systemd.Club.{method}"), "parameters": params}).to_string().into_bytes();
-    req.push(0);
-    s.write_all(&req).map_err(|e| e.to_string())?;
-    let mut buf = Vec::new();
-    BufReader::new(s).read_until(0, &mut buf).map_err(|e| e.to_string())?;
-    buf.pop();
-    let reply: Value = serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
-    match reply["error"].as_str() {
-        Some(e) => Err(e.to_string()),
-        None => Ok(reply["parameters"].clone()),
-    }
+/// Ask the running daemon whether this is the right password for `name`.
+pub fn check_password(name: &str, password: &str) -> bool {
+    let ask = || -> std::io::Result<Value> {
+        let mut s = UnixStream::connect(SOCKET)?;
+        // sshd waits on this during logins; a stuck daemon must not stall it forever
+        s.set_read_timeout(Some(TIMEOUT))?;
+        s.set_write_timeout(Some(TIMEOUT))?;
+        let req = json!({"method": "io.systemd.Club.Auth", "parameters": {"name": name, "password": password}});
+        s.write_all(format!("{req}\0").as_bytes())?;
+        let mut buf = Vec::new();
+        BufReader::new(s).read_until(0, &mut buf)?;
+        buf.pop();
+        Ok(serde_json::from_slice(&buf)?)
+    };
+    ask().is_ok_and(|reply| reply["parameters"]["ok"] == true)
 }
 
 #[cfg(test)]
@@ -172,56 +123,53 @@ mod tests {
     use super::*;
     use crate::users::test_users;
 
-    fn ask(u: &Users, peer: Option<u32>, method: &str, p: Value) -> Value {
-        handle(u, peer, &json!({"method": method, "parameters": p}))
+    fn ask(u: &Users, method: &str, p: Value) -> Value {
+        handle(u, &json!({"method": method, "parameters": p}))
     }
     const GET_USER: &str = "io.systemd.UserDatabase.GetUserRecord";
     const GET_GROUP: &str = "io.systemd.UserDatabase.GetGroupRecord";
+    const NOT_FOUND: &str = "io.systemd.UserDatabase.NoRecordFound";
 
     #[test]
     fn user_by_name_then_by_uid() {
         let u = test_users("vl-user");
-        let r = ask(&u, Some(1000), GET_USER, json!({"userName": "alice", "service": SERVICE}));
+        let r = ask(&u, GET_USER, json!({"userName": "alice", "service": SERVICE}));
         let rec = &r["parameters"]["record"];
         assert_eq!((rec["userName"].as_str(), rec["homeDirectory"].as_str()), (Some("alice"), Some("/home/club/alice")));
-        assert_eq!(rec["memoryMax"], 3u64 << 30);
         let uid = rec["uid"].as_u64().unwrap();
 
-        let r = ask(&u, None, GET_USER, json!({"uid": uid, "service": SERVICE}));
+        let r = ask(&u, GET_USER, json!({"uid": uid, "service": SERVICE}));
         assert_eq!(r["parameters"]["record"]["userName"], "alice");
-        let r = ask(&u, None, GET_USER, json!({"userName": "alice", "uid": uid + 1, "service": SERVICE}));
+        let r = ask(&u, GET_USER, json!({"userName": "alice", "uid": uid + 1, "service": SERVICE}));
         assert_eq!(r["error"], "io.systemd.UserDatabase.ConflictingRecordFound");
     }
 
     #[test]
     fn rejects_wrong_service_invalid_and_local_names() {
         let u = test_users("vl-bad");
-        let e = |name: &str, svc: &str| ask(&u, None, GET_USER, json!({"userName": name, "service": svc}))["error"].clone();
+        let e = |name: &str, svc: &str| ask(&u, GET_USER, json!({"userName": name, "service": svc}))["error"].clone();
         assert_eq!(e("alice", "io.systemd.Home"), "io.systemd.UserDatabase.BadService");
-        assert_eq!(e("Not Valid!", SERVICE), "io.systemd.UserDatabase.NoRecordFound");
-        assert_eq!(e("root", SERVICE), "io.systemd.UserDatabase.NoRecordFound");
-        let r = ask(&u, None, GET_USER, json!({"service": SERVICE}));
-        assert_eq!(r["error"], "io.systemd.UserDatabase.NoRecordFound", "enumeration is unsupported");
+        assert_eq!(e("Not Valid!", SERVICE), NOT_FOUND);
+        assert_eq!(e("root", SERVICE), NOT_FOUND);
+        assert_eq!(ask(&u, GET_USER, json!({"service": SERVICE}))["error"], NOT_FOUND, "no enumeration");
     }
 
     #[test]
-    fn group_lookups_never_allocate() {
+    fn group_lookups_never_create_placeholders() {
         let u = test_users("vl-grp");
-        let group = |u: &Users| ask(u, None, GET_GROUP, json!({"groupName": "ghost", "service": SERVICE}));
-        assert_eq!(group(&u)["error"], "io.systemd.UserDatabase.NoRecordFound");
-        ask(&u, None, GET_USER, json!({"userName": "ghost", "service": SERVICE}));
+        let group = |u: &Users| ask(u, GET_GROUP, json!({"groupName": "ghost", "service": SERVICE}));
+        assert_eq!(group(&u)["error"], NOT_FOUND);
+        ask(&u, GET_USER, json!({"userName": "ghost", "service": SERVICE}));
         assert_eq!(group(&u)["parameters"]["record"]["groupName"], "ghost");
     }
 
     #[test]
-    fn club_methods_are_root_only() {
-        let u = test_users("vl-admin");
-        ask(&u, None, GET_USER, json!({"userName": "alice", "service": SERVICE}));
-        let args = json!({"name": "alice", "password": "pw", "rhost": "1.2.3.4"});
-        let denied = ask(&u, Some(1000), "io.systemd.Club.Auth", args.clone());
-        assert_eq!(denied["error"], "org.varlink.service.PermissionDenied");
-        let ok = ask(&u, Some(0), "io.systemd.Club.Auth", args);
-        assert_eq!(ok["parameters"]["ok"], true);
-        assert_eq!(ask(&u, Some(0), "io.systemd.Club.List", json!({}))["parameters"]["members"][0][0], "alice");
+    fn auth_needs_the_password_and_a_prior_lookup() {
+        let u = test_users("vl-auth");
+        let auth = |pw: &str| ask(&u, "io.systemd.Club.Auth", json!({"name": "alice", "password": pw}))["parameters"]["ok"].clone();
+        assert_eq!(auth("pw"), false, "sshd has not asked about alice yet");
+        ask(&u, GET_USER, json!({"userName": "alice", "service": SERVICE}));
+        assert_eq!(auth("wrong"), false);
+        assert_eq!(auth("pw"), true);
     }
 }

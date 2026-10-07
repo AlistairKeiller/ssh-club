@@ -3,12 +3,11 @@ name = "club"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "On-demand SSH workspaces: any username + one shared password gets its own Linux account"
+description = "On-demand SSH accounts: any username + one shared password gets a private home"
 license = "MIT"
 
 [dependencies]
 serde_json = "1"
-libc = "0.2"
 
 [profile.release]
 lto = true

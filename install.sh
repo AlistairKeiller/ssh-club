@@ -1,7 +1,6 @@
 #!/bin/sh
 # One-line installer for a fresh machine:
 #   curl -fsSL https://raw.githubusercontent.com/OWNER/ssh-club/main/install.sh | sudo sh
-# Options are passed through, e.g.  ... | sudo sh -s -- --password 'my club password'
 set -eu
 
 REPO="${CLUB_REPO:-OWNER/ssh-club}"
